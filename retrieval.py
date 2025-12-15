@@ -4,6 +4,7 @@ import hashlib
 from scipy.integrate import quad
 from typing import List, Tuple, Dict, Set
 from database import PolygonDatabase
+from progress_bar import ProgressBar  # 导入进度条类
 
 """GDS文件解析"""
 
@@ -14,17 +15,24 @@ class GDSParser:
         boundary_pattern = re.compile(r'BOUNDARY.*?ENDEL', re.DOTALL)
         boundaries = boundary_pattern.findall(gds_content)
         polygons = []
+        # 添加进度条：解析BOUNDARY
+        progress = ProgressBar(total=len(boundaries), desc="解析GDS边界")
         for boundary in boundaries:
             xy_pattern = re.compile(r'(\d+):\s*(\d+)')
             xy_matches = xy_pattern.findall(boundary)
             if len(xy_matches) < 3:
+                progress.update()
                 continue
             polygon = np.array([[int(x), int(y)] for x, y in xy_matches], dtype=np.float64)
             polygons.append(polygon)
+            progress.update()
+        progress.finish()
         return polygons
 
 
 """转向函数计算与距离度量（融合两篇论文核心逻辑）"""
+
+
 class TurningFunction:
     @staticmethod
     def compute(polygon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -66,8 +74,6 @@ class TurningFunction:
 
         integrand = lambda x: abs(f(x) - g(x))
         distance, _ = quad(integrand, 0, 1, limit=1000)
-
-        print(f"1111111111111111111111111111111  {distance}")
         return distance
 
     @staticmethod
@@ -156,6 +162,8 @@ class LSHFamily:
 
 
 """多边形标准化"""
+
+
 class PolygonNormalizer:
     @staticmethod
     def normalize(polygon: np.ndarray) -> np.ndarray:
@@ -180,6 +188,8 @@ class PolygonNormalizer:
 
 
 """检索主类"""
+
+
 class PolygonSimilarRetrieval:
     def __init__(self, m_max: int = 1000, db_path: str = "polygon_db.pkl"):
         self.db = PolygonDatabase(db_path)
@@ -199,12 +209,21 @@ class PolygonSimilarRetrieval:
         return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hash)
 
     def add_gds_file(self, gds_path: str) -> int:
-        """从GDS文件批量添加多边形"""
+        """从GDS文件批量添加多边形（带进度条）"""
+        print(f"正在读取GDS文件：{gds_path}")
         with open(gds_path, 'r', encoding='utf-8') as f:
             gds_content = f.read()
+        # 解析GDS得到多边形列表（内部已带进度条）
         polygons = self.parser.parse(gds_content)
+        if not polygons:
+            print("未解析到有效多边形")
+            return 0
+        # 添加多边形到数据库（带进度条）
+        progress = ProgressBar(total=len(polygons), desc="添加多边形到数据库")
         for poly in polygons:
             self.add_polygon(poly)
+            progress.update()
+        progress.finish()
         return len(polygons)
 
     def retrieve_similar(self, query_polygon: np.ndarray,
@@ -212,7 +231,7 @@ class PolygonSimilarRetrieval:
                          r: float = 0.3,  # 放松阈值适配遮挡
                          c: float = 2.5,  # 扩大近似因子，提升遮挡召回
                          shift_steps: int = 8) -> List[Tuple[int, float]]:
-        """检索相似、旋转、部分遮挡的多边形"""
+        """检索相似、旋转、部分遮挡的多边形（带进度条）"""
         # 查询预处理
         query_normalized = self.normalizer.normalize(query_polygon)
         query_tf = self.tf_computer.compute(query_normalized)
@@ -224,17 +243,22 @@ class PolygonSimilarRetrieval:
         query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=200)
         candidates = self.db.get_candidates(query_l1_hash, query_l2_hash)
         if not candidates:
+            print("未找到候选多边形")
             return []
+        candidates = list(candidates)
 
-        # 计算真实距离（适配遮挡和旋转）
+        # 计算真实距离（带进度条）
+        progress = ProgressBar(total=len(candidates), desc="计算候选多边形距离")
         similar_results = []
         query_vertex_cnt = len(query_polygon)
         for idx in candidates:
             _, candidate_tf, candidate_tf_reduced, candidate_vertex_cnt = self.db.get_polygon_data(idx)
+            # 筛选顶点数差异过大的多边形
             if abs(query_vertex_cnt - candidate_vertex_cnt) > max(5, query_vertex_cnt * 0.5):
+                progress.update()
                 continue
 
-            # 计算对应距离
+            # 根据距离类型计算距离
             if distance_type == 'L1':
                 dist = self.tf_computer.l1_distance(query_tf_shifted, candidate_tf)
             elif distance_type == 'L2':
@@ -249,6 +273,8 @@ class PolygonSimilarRetrieval:
             # 筛选符合条件的结果
             if dist <= c * r:
                 similar_results.append((idx, dist))
+            progress.update()
+        progress.finish()
 
         # 按距离排序
         similar_results.sort(key=lambda x: x[1])
@@ -260,23 +286,26 @@ if __name__ == "__main__":
     # 添加GDS文件中的多边形
     gds_path = "test0.txt"
     added_cnt = retrieval.add_gds_file(gds_path)
-    print(f"成功添加{added_cnt}个多边形到数据库")
+    print(f"\n成功添加{added_cnt}个多边形到数据库")
 
     while True:
         if added_cnt > 0:
-            a = int(input())
+            a = int(input("\n请输入查询多边形索引（0~{}）：".format(added_cnt - 1)))
+            if a < 0 or a >= added_cnt:
+                print("索引超出范围")
+                continue
             query_poly = retrieval.db.get_polygon_data(a)[0]
             print(f"\n查询第{a}个多边形（顶点数：{len(query_poly)}）")
 
             similar = retrieval.retrieve_similar(
                 query_poly,
-                distance_type='L2',
-                r=0.3,
+                distance_type='L1',
+                r=0.8,
                 c=2.5,
-                shift_steps=8
+                shift_steps=10
             )
 
-            print(f"找到{len(similar)}个相似多边形：")
+            print(f"\n找到{len(similar)}个相似多边形：")
             for idx, dist in similar:
                 _, _, _, vertex_cnt = retrieval.db.get_polygon_data(idx)
                 print(f"  - 索引{idx}：距离={dist:.4f}，顶点数={vertex_cnt}")
