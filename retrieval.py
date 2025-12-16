@@ -34,7 +34,7 @@ class DistanceWorker(threading.Thread):
                 _, candidate_tf, candidate_tf_reduced, candidate_vertex_cnt = self.retrieval.db.get_polygon_data(idx)
 
                 # 顶点数过滤
-                if abs(query_vertex_cnt - candidate_vertex_cnt) > max(1, query_vertex_cnt * 0.25):
+                if abs(query_vertex_cnt - candidate_vertex_cnt) > max(5, query_vertex_cnt * 0.25):
                     continue
 
                 # 计算距离
@@ -283,8 +283,8 @@ class PolygonSimilarRetrieval:
         tf = self.tf_computer.compute(normalized_poly)
         tf_shifted = self.normalizer.vertical_shift(tf)
         tf_reduced = self.tf_computer.mean_reduce(*tf_shifted)
-        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=100)  # 哈希对比值（默认100）
-        l2_hash = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=200)  # 取样值（默认200）
+        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=50)  # 哈希对比值（默认100）
+        l2_hash = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=100)  # 取样值（默认200）
         return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hash)
 
     def add_gds_file(self, gds_path: str) -> int:
@@ -322,8 +322,8 @@ class PolygonSimilarRetrieval:
         query_data = (query_tf_reduced, query_tf_reduced, query_vertex_cnt)
 
         # 获取候选集
-        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=100)  # 哈希对比值（默认100）
-        query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=200)  # 取样值（默认200）
+        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=50)  # 哈希对比值（默认100）
+        query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=100)  # 取样值（默认200）
         candidates = self.db.get_candidates(query_l1_hash, query_l2_hash)
         if not candidates:
             print("未找到候选多边形")
@@ -374,10 +374,10 @@ if __name__ == "__main__":
 
             similar = retrieval.retrieve_similar(
                 query_poly,
-                distance_type='D1',
-                r=0.8,
-                c=2.5,
-                shift_steps=1
+                distance_type='D2',
+                r=1.0,
+                c=3.5,
+                shift_steps=5
             )
 
             print(f"\n找到{len(similar)}个相似多边形：")
