@@ -34,7 +34,7 @@ class DistanceWorker(threading.Thread):
                 _, candidate_tf, candidate_tf_reduced, candidate_vertex_cnt = self.retrieval.db.get_polygon_data(idx)
 
                 # 顶点数过滤
-                if abs(query_vertex_cnt - candidate_vertex_cnt) > max(5, query_vertex_cnt * 0.5):
+                if abs(query_vertex_cnt - candidate_vertex_cnt) > max(1, query_vertex_cnt * 0.25):
                     continue
 
                 # 计算距离
@@ -86,16 +86,16 @@ class TurningFunction:
     def compute(polygon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         # 计算边向量与角度
         edges = np.diff(polygon, axis=0)
-        edges = np.vstack([edges, polygon[0] - polygon[-1]])  # 闭合多边形
+        edges = np.vstack([edges, polygon[0] - polygon[-1]])
         angles = np.arctan2(edges[:, 1], edges[:, 0])
         edge_lengths = np.linalg.norm(edges, axis=1)
         total_length = edge_lengths.sum()
         # 归一化周长断点（增加密度，提升匹配精度）
         x = np.cumsum(edge_lengths / total_length)[:-1]
         x = np.insert(x, 0, 0.0)
-        # 累积角度（优化：添加角度归一化，消除旋转带来的整体偏移）
+        # 累积角度
         cumulative_angles = np.cumsum(angles)
-        # 角度归一化：将累积角度映射到[-π, π]区间，减少数值差异
+        # 将累积角度映射到[-π, π]区间，减少数值差异
         cumulative_angles = (cumulative_angles + np.pi) % (2 * np.pi) - np.pi
         y = np.insert(cumulative_angles, 0, 0.0)
         return x, y
@@ -141,7 +141,7 @@ class TurningFunction:
         if len(all_x) < 100:
             all_x = np.linspace(0, 1, 200)  # 兜底：生成200个均匀节点
 
-        # 步骤2：对两个TF在统一节点上插值（线性插值，保证连续性）
+        #对两个TF在统一节点上插值（线性插值，保证连续性）
         def interpolate(x_target, x_source, y_source):
             """线性插值，适配离散点"""
             if len(x_source) == 1:
@@ -183,7 +183,7 @@ class TurningFunction:
             if s == 0:
                 shifted_x, shifted_y = tf_c[0], tf_c[1]
             else:
-                # 优化2：循环平移+线性插值（避免平移后断点突变）
+                # 循环平移+线性插值（避免平移后断点突变）
                 shifted_x = np.roll(tf_c[0], s)
                 shifted_y = np.roll(tf_c[1], s)
                 # 对平移后的断点进行平滑（消除跳变）
@@ -248,10 +248,10 @@ class LSHFamily:
 class PolygonNormalizer:
     @staticmethod
     def normalize(polygon: np.ndarray) -> np.ndarray:
-        # 平移：中心归零
+        #平移
         centroid = np.mean(polygon, axis=0)
         polygon_translated = polygon - centroid
-        # 缩放：单位周长
+        #缩放
         edges = np.diff(polygon_translated, axis=0)
         edges = np.vstack([edges, polygon_translated[0] - polygon_translated[-1]])
         edge_lengths = np.linalg.norm(edges, axis=1)
@@ -283,8 +283,8 @@ class PolygonSimilarRetrieval:
         tf = self.tf_computer.compute(normalized_poly)
         tf_shifted = self.normalizer.vertical_shift(tf)
         tf_reduced = self.tf_computer.mean_reduce(*tf_shifted)
-        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=50)  # 哈希对比值（默认100）
-        l2_hash = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=100)  # 取样值（默认200）
+        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=100)  # 哈希对比值（默认100）
+        l2_hash = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=200)  # 取样值（默认200）
         return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hash)
 
     def add_gds_file(self, gds_path: str) -> int:
@@ -315,21 +315,21 @@ class PolygonSimilarRetrieval:
         query_normalized = self.normalizer.normalize(query_polygon)
         query_tf = self.tf_computer.compute(query_normalized)
         query_tf_shifted = self.normalizer.vertical_shift(query_tf)
-        query_tf_reduced = self.tf_computer.mean_reduce(*query_tf_shifted)
+        query_tf_reduced = self.tf_computer.mean_reduce(*query_tf)
         query_vertex_cnt = len(query_polygon)
 
         # 准备查询数据元组
-        query_data = (query_tf_shifted, query_tf_reduced, query_vertex_cnt)
+        query_data = (query_tf_reduced, query_tf_reduced, query_vertex_cnt)
 
         # 获取候选集
-        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=50)  # 哈希对比值（默认100）
-        query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=100)  # 取样值（默认200）
+        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=100)  # 哈希对比值（默认100）
+        query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=200)  # 取样值（默认200）
         candidates = self.db.get_candidates(query_l1_hash, query_l2_hash)
         if not candidates:
             print("未找到候选多边形")
             return []
         candidates = list(candidates)
-        print(f"找到{len(candidates)}个候选多边形，使用{max_threads}线程计算距离...")
+        print(f"找到{len(candidates)}个候选多边形")
 
         # 初始化线程队列和结果存储
         queue = Queue()
@@ -359,7 +359,6 @@ class PolygonSimilarRetrieval:
 
 if __name__ == "__main__":
     retrieval = PolygonSimilarRetrieval(m_max=1000)
-    # 添加GDS文件中的多边形
     gds_path = "test3.txt"
     added_cnt = retrieval.add_gds_file(gds_path)
     print(f"\n成功添加{added_cnt}个多边形到数据库")
@@ -377,8 +376,8 @@ if __name__ == "__main__":
                 query_poly,
                 distance_type='D1',
                 r=0.8,
-                c=3.5,
-                shift_steps=15
+                c=2.5,
+                shift_steps=1
             )
 
             print(f"\n找到{len(similar)}个相似多边形：")
