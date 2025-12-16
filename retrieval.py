@@ -301,7 +301,7 @@ class PolygonSimilarRetrieval:
         tf = self.tf_computer.compute(normalized_poly)
         tf_shifted = self.normalizer.vertical_shift(tf)
         tf_reduced = self.tf_computer.mean_reduce(*tf_shifted)
-        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=500)  # 增加哈希位数
+        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=700)  # 增加哈希位数
         l2_hashes = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=500, segments=3)  # 分段哈希
         return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hashes)
 
@@ -342,7 +342,7 @@ class PolygonSimilarRetrieval:
         query_data = (query_tf_shifted, query_tf_reduced, query_vertex_cnt)
 
         # 获取候选集
-        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=20)
+        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=30)
         query_l2_hashes = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=500, segments=3)
         candidates = self.db.get_candidates(query_l1_hash, query_l2_hashes, distance_type)
         if not candidates:
@@ -394,8 +394,8 @@ if __name__ == "__main__":
 
             similar = retrieval.retrieve_similar(
                 query_poly,
-                distance_type='D1',
-                r=0.8,
+                distance_type='L2',
+                r=1.0,
                 c=3.5,
                 shift_steps=3
             )
