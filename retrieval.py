@@ -1,3 +1,4 @@
+from queue import Queue
 import numpy as np
 import re
 import hashlib
@@ -5,6 +6,57 @@ from scipy.integrate import quad
 from typing import List, Tuple, Dict, Set
 from database import PolygonDatabase
 from progress_bar import ProgressBar  # 导入进度条类
+import threading
+
+
+class DistanceWorker(threading.Thread):
+    def __init__(self, queue, result_list, lock, retrieval_obj, query_data, distance_type, shift_steps, r, c):
+        super().__init__()
+        self.queue = queue
+        self.result_list = result_list
+        self.lock = lock
+        self.retrieval = retrieval_obj
+        self.query_data = query_data
+        self.distance_type = distance_type
+        self.shift_steps = shift_steps
+        self.r = r
+        self.c = c
+        self.daemon = True
+
+    def run(self):
+        while not self.queue.empty():
+            idx = self.queue.get()
+            try:
+                # 获取查询数据
+                query_tf_shifted, query_tf_reduced, query_vertex_cnt = self.query_data
+
+                # 获取候选多边形数据
+                _, candidate_tf, candidate_tf_reduced, candidate_vertex_cnt = self.retrieval.db.get_polygon_data(idx)
+
+                # 顶点数过滤
+                if abs(query_vertex_cnt - candidate_vertex_cnt) > max(5, query_vertex_cnt * 0.5):
+                    continue
+
+                # 计算距离
+                if self.distance_type == 'L1':
+                    dist = self.retrieval.tf_computer.l1_distance(query_tf_shifted, candidate_tf)
+                elif self.distance_type == 'L2':
+                    dist = self.retrieval.tf_computer.l2_distance(query_tf_reduced, candidate_tf_reduced)
+                elif self.distance_type == 'D1':
+                    dist = self.retrieval.tf_computer.d1_distance(query_tf_shifted, candidate_tf, self.shift_steps)
+                elif self.distance_type == 'D2':
+                    dist = self.retrieval.tf_computer.d2_distance(query_tf_reduced, candidate_tf_reduced,
+                                                                  self.shift_steps)
+                else:
+                    raise ValueError(f"不支持的距离类型：{self.distance_type}")
+
+                # 结果过滤与保存
+                if dist <= self.c * self.r:
+                    with self.lock:
+                        self.result_list.append((idx, dist))
+            finally:
+                self.queue.task_done()
+
 
 """GDS文件解析"""
 
@@ -130,6 +182,8 @@ class LSHFamily:
         self.b_m = ((m_max // 2) + 3) * np.pi
         self.span_m = (self.b_m - self.a_m) / 2  # 范围优化
 
+    """哈希的随机采样点数量的参数在这里！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！"""
+
     def random_point_lsh(self, tf: Tuple[np.ndarray, np.ndarray], num_hashes: int = 100) -> str:
         """random-point-LSH（L₁适配）"""
         f_x, f_y = tf
@@ -147,6 +201,8 @@ class LSHFamily:
                 hash_bits.append('0')
         return ''.join(hash_bits)
 
+    """哈希时对转向函数的采样点数在这里！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！"""
+
     def discrete_sample_lsh(self, tf: Tuple[np.ndarray, np.ndarray], n_samples: int = 200) -> str:
         """discrete-sample-LSH（L₂适配）"""
         f_x, f_y = tf
@@ -162,8 +218,6 @@ class LSHFamily:
 
 
 """多边形标准化"""
-
-
 class PolygonNormalizer:
     @staticmethod
     def normalize(polygon: np.ndarray) -> np.ndarray:
@@ -188,8 +242,6 @@ class PolygonNormalizer:
 
 
 """检索主类"""
-
-
 class PolygonSimilarRetrieval:
     def __init__(self, m_max: int = 1000, db_path: str = "polygon_db.pkl"):
         self.db = PolygonDatabase(db_path)
@@ -204,8 +256,8 @@ class PolygonSimilarRetrieval:
         tf = self.tf_computer.compute(normalized_poly)
         tf_shifted = self.normalizer.vertical_shift(tf)
         tf_reduced = self.tf_computer.mean_reduce(*tf_shifted)
-        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=100)
-        l2_hash = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=200)
+        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=200)  # 哈希对比值（默认100）
+        l2_hash = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=400)  # 取样值（默认200）
         return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hash)
 
     def add_gds_file(self, gds_path: str) -> int:
@@ -230,61 +282,107 @@ class PolygonSimilarRetrieval:
                          distance_type: str = 'D2',
                          r: float = 0.3,  # 放松阈值适配遮挡
                          c: float = 2.5,  # 扩大近似因子，提升遮挡召回
-                         shift_steps: int = 8) -> List[Tuple[int, float]]:
+                         shift_steps: int = 8,
+                         max_threads: int = 16) -> List[Tuple[int, float]]:
         """检索相似、旋转、部分遮挡的多边形（带进度条）"""
+        # # 查询预处理
+        # query_normalized = self.normalizer.normalize(query_polygon)
+        # query_tf = self.tf_computer.compute(query_normalized)
+        # query_tf_shifted = self.normalizer.vertical_shift(query_tf)
+        # query_tf_reduced = self.tf_computer.mean_reduce(*query_tf_shifted)
+        #
+        # # 获取候选集
+        # query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=100)
+        # query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=200)
+        # candidates = self.db.get_candidates(query_l1_hash, query_l2_hash)
+        # if not candidates:
+        #     print("未找到候选多边形")
+        #     return []
+        # candidates = list(candidates)
+        #
+        # # 计算真实距离（带进度条）
+        # progress = ProgressBar(total=len(candidates), desc="计算候选多边形距离")
+        # similar_results = []
+        # query_vertex_cnt = len(query_polygon)
+        # for idx in candidates:
+        #     _, candidate_tf, candidate_tf_reduced, candidate_vertex_cnt = self.db.get_polygon_data(idx)
+        #     # 筛选顶点数差异过大的多边形
+        #     if abs(query_vertex_cnt - candidate_vertex_cnt) > max(5, query_vertex_cnt * 0.5):
+        #         progress.update()
+        #         continue
+        #
+        #     # 根据距离类型计算距离
+        #     if distance_type == 'L1':
+        #         dist = self.tf_computer.l1_distance(query_tf_shifted, candidate_tf)
+        #     elif distance_type == 'L2':
+        #         dist = self.tf_computer.l2_distance(query_tf_reduced, candidate_tf_reduced)
+        #     elif distance_type == 'D1':
+        #         dist = self.tf_computer.d1_distance(query_tf_shifted, candidate_tf, shift_steps=shift_steps)
+        #     elif distance_type == 'D2':
+        #         dist = self.tf_computer.d2_distance(query_tf_reduced, candidate_tf_reduced, shift_steps=shift_steps)
+        #     else:
+        #         raise ValueError(f"不支持的距离类型：{distance_type}")
+        #
+        #     # 筛选符合条件的结果
+        #     if dist <= c * r:
+        #         similar_results.append((idx, dist))
+        #     progress.update()
+        # progress.finish()
+        #
+        # # 按距离排序
+        # similar_results.sort(key=lambda x: x[1])
+        # return similar_results
+
         # 查询预处理
         query_normalized = self.normalizer.normalize(query_polygon)
         query_tf = self.tf_computer.compute(query_normalized)
         query_tf_shifted = self.normalizer.vertical_shift(query_tf)
         query_tf_reduced = self.tf_computer.mean_reduce(*query_tf_shifted)
+        query_vertex_cnt = len(query_polygon)
+
+        # 准备查询数据元组
+        query_data = (query_tf_shifted, query_tf_reduced, query_vertex_cnt)
 
         # 获取候选集
-        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=100)
-        query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=200)
+        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=200)  # 哈希对比值（默认100）
+        query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=400)  # 取样值（默认200）
         candidates = self.db.get_candidates(query_l1_hash, query_l2_hash)
         if not candidates:
             print("未找到候选多边形")
             return []
         candidates = list(candidates)
+        print(f"找到{len(candidates)}个候选多边形，使用{max_threads}线程计算距离...")
 
-        # 计算真实距离（带进度条）
-        progress = ProgressBar(total=len(candidates), desc="计算候选多边形距离")
-        similar_results = []
-        query_vertex_cnt = len(query_polygon)
+        # 初始化线程队列和结果存储
+        queue = Queue()
         for idx in candidates:
-            _, candidate_tf, candidate_tf_reduced, candidate_vertex_cnt = self.db.get_polygon_data(idx)
-            # 筛选顶点数差异过大的多边形
-            if abs(query_vertex_cnt - candidate_vertex_cnt) > max(5, query_vertex_cnt * 0.5):
-                progress.update()
-                continue
+            queue.put(idx)
 
-            # 根据距离类型计算距离
-            if distance_type == 'L1':
-                dist = self.tf_computer.l1_distance(query_tf_shifted, candidate_tf)
-            elif distance_type == 'L2':
-                dist = self.tf_computer.l2_distance(query_tf_reduced, candidate_tf_reduced)
-            elif distance_type == 'D1':
-                dist = self.tf_computer.d1_distance(query_tf_shifted, candidate_tf, shift_steps=shift_steps)
-            elif distance_type == 'D2':
-                dist = self.tf_computer.d2_distance(query_tf_reduced, candidate_tf_reduced, shift_steps=shift_steps)
-            else:
-                raise ValueError(f"不支持的距离类型：{distance_type}")
+        result_list = []
+        lock = threading.Lock()
+        threads = []
 
-            # 筛选符合条件的结果
-            if dist <= c * r:
-                similar_results.append((idx, dist))
-            progress.update()
-        progress.finish()
+        # 创建并启动线程
+        for _ in range(min(max_threads, len(candidates))):
+            worker = DistanceWorker(
+                queue, result_list, lock, self, query_data,
+                distance_type, shift_steps, r, c
+            )
+            threads.append(worker)
+            worker.start()
+
+        # 等待所有任务完成
+        queue.join()
 
         # 按距离排序
-        similar_results.sort(key=lambda x: x[1])
-        return similar_results
+        result_list.sort(key=lambda x: x[1])
+        return result_list
 
 
 if __name__ == "__main__":
     retrieval = PolygonSimilarRetrieval(m_max=1000)
     # 添加GDS文件中的多边形
-    gds_path = "test0.txt"
+    gds_path = "test1.txt"
     added_cnt = retrieval.add_gds_file(gds_path)
     print(f"\n成功添加{added_cnt}个多边形到数据库")
 
@@ -299,10 +397,10 @@ if __name__ == "__main__":
 
             similar = retrieval.retrieve_similar(
                 query_poly,
-                distance_type='L1',
-                r=0.8,
+                distance_type='D1',
+                r=0.2,
                 c=2.5,
-                shift_steps=10
+                shift_steps=1
             )
 
             print(f"\n找到{len(similar)}个相似多边形：")
