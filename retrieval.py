@@ -33,8 +33,9 @@ class DistanceWorker(threading.Thread):
                 # 获取候选多边形数据
                 _, candidate_tf, candidate_tf_reduced, candidate_vertex_cnt = self.retrieval.db.get_polygon_data(idx)
 
-                # 顶点数过滤
-                if abs(query_vertex_cnt - candidate_vertex_cnt) > max(5, query_vertex_cnt * 0.25):
+                # 顶点数动态过滤（优化版本）
+                vertex_diff_threshold = max(3, min(5, query_vertex_cnt * 0.3))  # 自适应阈值
+                if abs(query_vertex_cnt - candidate_vertex_cnt) > vertex_diff_threshold:
                     continue
 
                 # 计算距离
@@ -59,6 +60,8 @@ class DistanceWorker(threading.Thread):
 
 
 """GDS文件解析"""
+
+
 class GDSParser:
     @staticmethod
     def parse(gds_content: str) -> List[np.ndarray]:
@@ -81,6 +84,8 @@ class GDSParser:
 
 
 """转向函数计算与距离度量（融合两篇论文核心逻辑）"""
+
+
 class TurningFunction:
     @staticmethod
     def compute(polygon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -141,7 +146,7 @@ class TurningFunction:
         if len(all_x) < 100:
             all_x = np.linspace(0, 1, 200)  # 兜底：生成200个均匀节点
 
-        #对两个TF在统一节点上插值（线性插值，保证连续性）
+        # 对两个TF在统一节点上插值（线性插值，保证连续性）
         def interpolate(x_target, x_source, y_source):
             """线性插值，适配离散点"""
             if len(x_source) == 1:
@@ -149,6 +154,7 @@ class TurningFunction:
             # 线性插值（避免超出边界）
             y_interp = np.interp(x_target, x_source, y_source, left=y_source[0], right=y_source[-1])
             return y_interp
+
         # 得到统一节点上的y值
         y1_interp = interpolate(all_x, x1, y1)
         y2_interp = interpolate(all_x, x2, y2)
@@ -204,6 +210,8 @@ class TurningFunction:
 
 
 """LSH哈希（论文1核心结构）"""
+
+
 class LSHFamily:
     def __init__(self, m_max: int = 1000):
         self.m_max = m_max
@@ -211,8 +219,7 @@ class LSHFamily:
         self.b_m = ((m_max // 2) + 3) * np.pi
         self.span_m = (self.b_m - self.a_m) / 2  # 范围优化
 
-    """哈希的随机采样点数量的参数在这里！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！"""
-    def random_point_lsh(self, tf: Tuple[np.ndarray, np.ndarray], num_hashes: int = 100) -> str:
+    def random_point_lsh(self, tf: Tuple[np.ndarray, np.ndarray], num_hashes: int = 200) -> str:  # 增加哈希位数
         """random-point-LSH（L₁适配）"""
         f_x, f_y = tf
         hash_bits = []
@@ -229,9 +236,9 @@ class LSHFamily:
                 hash_bits.append('0')
         return ''.join(hash_bits)
 
-    """哈希时对转向函数的采样点数在这里！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！"""
-    def discrete_sample_lsh(self, tf: Tuple[np.ndarray, np.ndarray], n_samples: int = 200) -> str:
-        """discrete-sample-LSH（L₂适配）"""
+    def discrete_sample_lsh(self, tf: Tuple[np.ndarray, np.ndarray], n_samples: int = 500, segments: int = 5) -> List[
+        str]:  # 分段哈希
+        """discrete-sample-LSH（L₂适配）：返回分段哈希列表"""
         f_x, f_y = tf
         sample_x = np.linspace(0, 1, n_samples)
         sample_y = []
@@ -240,18 +247,27 @@ class LSHFamily:
             sample_y.append(f_y[idx] if idx >= 0 else f_y[0])
         sample_y = np.array(sample_y)
         vec = sample_y / np.sqrt(n_samples)
-        vec_str = ','.join([f"{v:.6f}" for v in vec])
-        return hashlib.sha256(vec_str.encode()).hexdigest()
+
+        # 分段计算哈希
+        segment_size = n_samples // segments
+        hashes = []
+        for i in range(segments):
+            segment = vec[i * segment_size: (i + 1) * segment_size]
+            seg_str = ','.join([f"{v:.6f}" for v in segment])
+            hashes.append(hashlib.sha256(seg_str.encode()).hexdigest())
+        return hashes
 
 
 """多边形标准化"""
+
+
 class PolygonNormalizer:
     @staticmethod
     def normalize(polygon: np.ndarray) -> np.ndarray:
-        #平移
+        # 平移
         centroid = np.mean(polygon, axis=0)
         polygon_translated = polygon - centroid
-        #缩放
+        # 缩放
         edges = np.diff(polygon_translated, axis=0)
         edges = np.vstack([edges, polygon_translated[0] - polygon_translated[-1]])
         edge_lengths = np.linalg.norm(edges, axis=1)
@@ -269,6 +285,8 @@ class PolygonNormalizer:
 
 
 """检索主类"""
+
+
 class PolygonSimilarRetrieval:
     def __init__(self, m_max: int = 1000, db_path: str = "polygon_db.pkl"):
         self.db = PolygonDatabase(db_path)
@@ -283,9 +301,9 @@ class PolygonSimilarRetrieval:
         tf = self.tf_computer.compute(normalized_poly)
         tf_shifted = self.normalizer.vertical_shift(tf)
         tf_reduced = self.tf_computer.mean_reduce(*tf_shifted)
-        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=50)  # 哈希对比值（默认100）
-        l2_hash = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=100)  # 取样值（默认200）
-        return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hash)
+        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=500)  # 增加哈希位数
+        l2_hashes = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=500, segments=3)  # 分段哈希
+        return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hashes)
 
     def add_gds_file(self, gds_path: str) -> int:
         """从GDS文件批量添加多边形（带进度条）"""
@@ -297,12 +315,14 @@ class PolygonSimilarRetrieval:
         if not polygons:
             print("未解析到有效多边形")
             return 0
-        # 添加多边形到数据库（带进度条）
+
         progress = ProgressBar(total=len(polygons), desc="添加多边形到数据库")
         for poly in polygons:
             self.add_polygon(poly)
             progress.update()
         progress.finish()
+
+        #self.db._save_db()
         return len(polygons)
 
     def retrieve_similar(self, query_polygon: np.ndarray,
@@ -319,12 +339,12 @@ class PolygonSimilarRetrieval:
         query_vertex_cnt = len(query_polygon)
 
         # 准备查询数据元组
-        query_data = (query_tf_reduced, query_tf_reduced, query_vertex_cnt)
+        query_data = (query_tf_shifted, query_tf_reduced, query_vertex_cnt)
 
         # 获取候选集
-        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=50)  # 哈希对比值（默认100）
-        query_l2_hash = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=100)  # 取样值（默认200）
-        candidates = self.db.get_candidates(query_l1_hash, query_l2_hash)
+        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=20)
+        query_l2_hashes = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=500, segments=3)
+        candidates = self.db.get_candidates(query_l1_hash, query_l2_hashes, distance_type)
         if not candidates:
             print("未找到候选多边形")
             return []
@@ -374,10 +394,10 @@ if __name__ == "__main__":
 
             similar = retrieval.retrieve_similar(
                 query_poly,
-                distance_type='D2',
-                r=1.0,
+                distance_type='D1',
+                r=0.8,
                 c=3.5,
-                shift_steps=5
+                shift_steps=3
             )
 
             print(f"\n找到{len(similar)}个相似多边形：")
