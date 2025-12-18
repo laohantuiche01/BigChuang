@@ -60,8 +60,6 @@ class DistanceWorker(threading.Thread):
 
 
 """GDS文件解析"""
-
-
 class GDSParser:
     @staticmethod
     def parse(gds_content: str) -> List[np.ndarray]:
@@ -84,8 +82,6 @@ class GDSParser:
 
 
 """转向函数计算与距离度量（融合两篇论文核心逻辑）"""
-
-
 class TurningFunction:
     @staticmethod
     def compute(polygon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -210,8 +206,6 @@ class TurningFunction:
 
 
 """LSH哈希（论文1核心结构）"""
-
-
 class LSHFamily:
     def __init__(self, m_max: int = 1000):
         self.m_max = m_max
@@ -259,8 +253,6 @@ class LSHFamily:
 
 
 """多边形标准化"""
-
-
 class PolygonNormalizer:
     @staticmethod
     def normalize(polygon: np.ndarray) -> np.ndarray:
@@ -285,8 +277,6 @@ class PolygonNormalizer:
 
 
 """检索主类"""
-
-
 class PolygonSimilarRetrieval:
     def __init__(self, m_max: int = 1000, db_path: str = "polygon_db.pkl"):
         self.db = PolygonDatabase(db_path)
@@ -301,8 +291,8 @@ class PolygonSimilarRetrieval:
         tf = self.tf_computer.compute(normalized_poly)
         tf_shifted = self.normalizer.vertical_shift(tf)
         tf_reduced = self.tf_computer.mean_reduce(*tf_shifted)
-        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=700)  # 增加哈希位数
-        l2_hashes = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=500, segments=3)  # 分段哈希
+        l1_hash = self.lsh.random_point_lsh(tf_shifted, num_hashes=500)  # 增加哈希位数
+        l2_hashes = self.lsh.discrete_sample_lsh(tf_reduced, n_samples=500, segments=2)  # 分段哈希
         return self.db.add_polygon(polygon, normalized_poly, tf_shifted, tf_reduced, l1_hash, l2_hashes)
 
     def add_gds_file(self, gds_path: str) -> int:
@@ -310,7 +300,7 @@ class PolygonSimilarRetrieval:
         print(f"正在读取GDS文件：{gds_path}")
         with open(gds_path, 'r', encoding='utf-8') as f:
             gds_content = f.read()
-        # 解析GDS得到多边形列表（内部已带进度条）
+        # 解析GDS得到多边形列表
         polygons = self.parser.parse(gds_content)
         if not polygons:
             print("未解析到有效多边形")
@@ -338,12 +328,11 @@ class PolygonSimilarRetrieval:
         query_tf_reduced = self.tf_computer.mean_reduce(*query_tf)
         query_vertex_cnt = len(query_polygon)
 
-        # 准备查询数据元组
         query_data = (query_tf_shifted, query_tf_reduced, query_vertex_cnt)
 
         # 获取候选集
-        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=30)
-        query_l2_hashes = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=500, segments=3)
+        query_l1_hash = self.lsh.random_point_lsh(query_tf_shifted, num_hashes=0)
+        query_l2_hashes = self.lsh.discrete_sample_lsh(query_tf_reduced, n_samples=0, segments=2)
         candidates = self.db.get_candidates(query_l1_hash, query_l2_hashes, distance_type)
         if not candidates:
             print("未找到候选多边形")
@@ -351,7 +340,6 @@ class PolygonSimilarRetrieval:
         candidates = list(candidates)
         print(f"找到{len(candidates)}个候选多边形")
 
-        # 初始化线程队列和结果存储
         queue = Queue()
         for idx in candidates:
             queue.put(idx)
@@ -359,8 +347,6 @@ class PolygonSimilarRetrieval:
         result_list = []
         lock = threading.Lock()
         threads = []
-
-        # 创建并启动线程
         for _ in range(min(max_threads, len(candidates))):
             worker = DistanceWorker(
                 queue, result_list, lock, self, query_data,
@@ -368,11 +354,7 @@ class PolygonSimilarRetrieval:
             )
             threads.append(worker)
             worker.start()
-
-        # 等待所有任务完成
         queue.join()
-
-        # 按距离排序
         result_list.sort(key=lambda x: x[1])
         return result_list
 
@@ -380,6 +362,7 @@ class PolygonSimilarRetrieval:
 if __name__ == "__main__":
     retrieval = PolygonSimilarRetrieval(m_max=1000)
     gds_path = "test3.txt"
+    #added_cnt = 48755
     added_cnt = retrieval.add_gds_file(gds_path)
     print(f"\n成功添加{added_cnt}个多边形到数据库")
 
